@@ -31,8 +31,8 @@ declare -r VERSION=$(cat $SCRIPTDIR/VERSION)
 owner=$(id -un)
 declare -r LSOF=$([[ ! -f /bin/lsof ]] && which lsof || echo "lsof")
 
-PGBASENV_EXCLUDE_DIRS_DEF="tmp proc sys"
-PGBASENV_EXCLUDE_FILESYSTEMS_DEF="nfs tmpfs"
+PGBASENV_EXCLUDE_DIRS_DEF="bin boot dev etc lib lib32 lib64 proc root run sbin sys tmp usr"
+PGBASENV_EXCLUDE_FILESYSTEMS_DEF="autofs nfs nfs4 ramfs tmpfs"
 PGBASENV_SEARCH_MAXDEPTH_DEF=7
 PGBASENV_SEARCH_TIMEOUT_DEF=5
 
@@ -183,20 +183,27 @@ done
 find_pg_data() {
 local existing_data_ids="$1"
 local existing_ids=" $(echo "$existing_data_ids" | cut -d";" -f4) "
-local d dir size ftime home fhtime version data_id data_ids existing_data_id id_length orig_length skip existing_port existing_home
+local d dir size ftime home fhtime version data_id data_ids existing_data_id id_length orig_length skip existing_port existing_home cluster_name
 for d in $(echo $ALL_DIRS); do
-  if [[ -f $d/pg_control ]]; then
+  if [[ -f $d/pg_control && -O $d/pg_control ]]; then
     dir="$(dirname $d)"
     [[ -f $dir/PG_VERSION ]] && version=$(head -1 $dir/PG_VERSION) || version=0
     if [[ -f $dir/postmaster.opts ]]; then
       home=$(dirname $(dirname $(cat $dir/postmaster.opts | awk '{print $1}')))
+      content=$(cat $dir/postmaster.opts)
+      cluster_name=$(grep -q "cluster_name=" $dir/postmaster.opts && echo ${content#*--cluster_name=} | awk '{ print $1 }' | sed 's/.$//')
     else
       home=""
+      cluster_name=""
     fi
 
     # Define id for the current data dir
      if [[ -z $existing_data_ids ]]; then
-       data_id="pgd${version//./}"
+       if [[ ! -z $cluster_name ]]; then
+         data_id=$cluster_name
+       else
+         data_id="pgd${version//./}"
+       fi
        skip=0
      else
        # Data dir id was already defined then we will use the same one
@@ -207,7 +214,11 @@ for d in $(echo $ALL_DIRS); do
        if [[ ! -z $existing_data_id ]]; then 
           data_id=$existing_data_id && skip=1
        else
-          data_id="pgd${version//./}" && skip=0
+         if [[ ! -z $cluster_name ]]; then
+           data_id=$cluster_name && skip=0
+         else
+           data_id="pgd${version//./}" && skip=0
+         fi
        fi
      fi
 
@@ -303,12 +314,32 @@ generate_pgclustertab() {
     data_ids="$(cat $pgclustertab_file | grep -vE '^ *#' | awk -F";" '{print $1";"$3";"$4";"$5}')"
     # Pass data dir ids to the data dir discovery function
     local save_comments="$(cat $pgclustertab_file | grep -E '^ *#')"
+    #new_file=$(find_pg_data "$data_ids" | sort -k 4 -t ";")
+    new_file=$(find_pg_data "$data_ids")
     if [[ -z $save_comments ]]; then
-      find_pg_data "$data_ids" > $pgclustertab_file
+      # -n avoids newline since pgclustertab should not contain empty lines
+      echo -n "" > $pgclustertab_file
     else
      echo "$save_comments" > $pgclustertab_file
-     find_pg_data "$data_ids" >> $pgclustertab_file
     fi
+
+    # Append cluster entries from existing (former) pgclustertab to new file if they were not detected anymore.
+    # By default ,the tool keeps clusters that cannot be detected anymore on the system.
+    # This avoids that clusters disappears from pgclustertab for example during a restore when global/pg_control is not accessible
+    # and pgBasEnv cannot detect the cluster temporarily.
+    for i in $old_file
+    do
+      echo $new_file | grep -q $i
+      if [[ $? -eq 1 ]] && [[ $pgbasenv_CLEAN_PGCLUSTERTAB -eq 0 ]]; then
+        new_file=$(echo -e "$new_file\n$i")
+      fi
+    done
+
+    # sed removes empty lines since pgclustertab must not have any of them.
+    # Empty lines can occur if no instance can be detected
+    echo "$new_file" | sed '/^$/d' | sort >> $pgclustertab_file
+
+    # Write changes to the change file
     change=$(diff <(echo "$old_file") $pgclustertab_file)
     if [[ $? -gt 0 ]]; then
        echo "-----$(date +"%Y-%m-%d %H:%M:%S")----------------------------------------------------------------" >> $pgclustertab_file.change
@@ -329,13 +360,18 @@ generate_pgclustertab() {
 
 ###### MAIN ##########################################
 
-[[ ! $1 =~ --force|--version|^$ ]] && echo "ERROR: Wrong argument $1. It can be --force or --version." && exit 1
+[[ ! $1 =~ --force|--version|--clean-pgclustertab|^$ ]] && echo "ERROR: Wrong argument $1. It can be --clean-pgclustertab, --force or --version." && exit 1
 
 [[ $1 == "--version" ]] && echo "$VERSION" && exit 0
 if [[ $1 == "--force" ]]; then
    echo -e "\nExecuting in force mode.\n"
-   rm $pghometab_file 2> /dev/null 
-   rm $pgclustertab_file 2> /dev/null 
+   rm $pghometab_file 2> /dev/null
+   rm $pgclustertab_file 2> /dev/null
+fi
+pgbasenv_CLEAN_PGCLUSTERTAB=0
+if [[ $1 == "--clean-pgclustertab" ]]; then
+   echo -e "\nExecuting in clean pgclustertab mode.\n"
+   pgbasenv_CLEAN_PGCLUSTERTAB=1
 fi
 
 
